@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- EX-G Pro app: thumb trackball from above (red ball left, buttons on top), Purple palette accent -->
+  <defs><radialGradient id="ball" cx=".35" cy=".3" r=".8"><stop offset="0" stop-color="#ff8c8c"/><stop offset=".4" stop-color="#d81f26"/><stop offset="1" stop-color="#600a0d"/></radialGradient></defs>
+  <path d="M50 10 C70 4 104 6 116 16 C124 44 122 90 102 116 C86 128 54 128 40 116 C24 104 20 82 24 70 C28 56 34 48 36 40 C38 24 40 14 50 10 Z" fill="#26262c" stroke="#cba6f7" stroke-opacity=".5" stroke-width="2"/>
+  <rect x="52" y="12" width="26" height="40" rx="5" fill="#34343c"/>
+  <rect x="84" y="12" width="24" height="42" rx="5" fill="#34343c"/>
+  <rect x="74" y="20" width="12" height="22" rx="4" fill="#4a4a54"/>
+  <circle cx="46" cy="86" r="23" fill="#16161a"/>
+  <circle cx="46" cy="86" r="19" fill="url(#ball)"/>
+</svg>

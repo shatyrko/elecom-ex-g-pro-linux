@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=EX-G Pro
+GenericName=Trackball button settings
+Comment=ELECOM EX-G Pro trackball (M-XPT1MR): assign any shortcut, action, app or command to its buttons and wheel tilt
+Exec=sh -c 'exec "$HOME/.local/bin/macro-keys-studio" --device exgpro'
+Icon=dev.alecsh.ExgPro
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=elecom;ex-g;trackball;mouse;buttons;remap;

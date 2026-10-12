@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+"""macro-keys-studio - settings app for one small macro device on Linux (GTK4 + libadwaita).
+
+  macro-keys-studio --device <id>      (<id>: a description file in ~/.local/share/macro-keys/devices)
+
+The device's real product photo (downloaded once from the maker's or a shop's listing, not kept in
+the repository) with every key, button, knob or wheel direction as an area on it: click one, or
+press it on the device, and choose what it does: its own key, any keyboard shortcut (recorded by
+pressing it), a desktop action, an app, a command or typed text. Knobs and wheels have both
+directions (and "press" where they press) with quick presets. "All apps" settings plus per-app
+profiles (used while that app's window is focused). "Which button is which?" learns where each
+key is. Saved to ~/.config/macro-keys/<id>.json; the device's service (`macro-keys --device <id>`,
+a systemd user unit) applies changes at once.
+"""
+import importlib.machinery, importlib.util, json, math, os, socket, subprocess, sys, threading, time
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+try:  # GLib >= 2.86 moved DesktopAppInfo to GioUnix
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PHOTO_DIR = os.path.expanduser("~/.cache/macro-keys/photos")
+_loader = importlib.machinery.SourceFileLoader("macro_keys", os.path.join(HERE, "macro-keys"))
+_spec = importlib.util.spec_from_loader("macro_keys", _loader)
+D = importlib.util.module_from_spec(_spec)
+_loader.exec_module(D)
+
+# per device, from its description file
+APPS = {k: (d["app_id"], d["unit"]) for k, d in D.DEVICES.items()}      # launcher / icon name, user unit
+CALIBRATE = {k: d["calibrate"] for k, d in D.DEVICES.items() if d.get("calibrate")}
+TYPES = [("default", "Its own key"), ("keys", "Keyboard shortcut"), ("action", "Desktop action"),
+         ("app", "Open an app"), ("command", "Run a command"), ("text", "Type text"), ("none", "Nothing")]
+INHERIT = ("inherit", "Same as “All apps”")
+KNOB_IDS = ("knob_right", "knob_left", "knob_press")
+
+
+def rgba(hexstr, a=1.0):
+    h = hexstr.lstrip("#")
+    return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255, a
+
+
+def rounded(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+# ------------------------------------------------------------------ product photos
+# The maker's own product photo of each device, downloaded once into ~/.cache/macro-keys/photos
+# (not kept in the repository: the photos belong to the makers). Prepared here: cropped, scaled,
+# white background made transparent. Button areas below are in pixels of the prepared photo.
+PHOTOS = {k: d.get("photos", []) for k, d in D.DEVICES.items()}   # one or more photos per device
+HOT = {k: d.get("hot", []) for k, d in D.DEVICES.items()}           # each control's area on each photo
+PHOTO_ICONS = {k: d["app_id"] for k, d in D.DEVICES.items() if d.get("photo_icon")}   # icon from the photo
+
+
+def photo_path(kind, i=0):
+    return os.path.join(PHOTO_DIR, f"{kind}.png" if i == 0 else f"{kind}-{i}.png")
+
+
+def prepare_photos(kind):
+    """All photos of a device, prepared (downloaded once); None when one is missing (offline)."""
+    paths = []
+    for i, spec in enumerate(PHOTOS.get(kind, [])):
+        path = prepare_photo(kind, i, spec)
+        if not path:
+            return None
+        paths.append(path)
+    if kind in PHOTO_ICONS and paths:
+        make_icon(paths[0], PHOTO_ICONS[kind])
+    return paths or None
+
+
+def make_icon(photo, app_id):
+    """Launcher icon from the photo: the device cut out, centred on a transparent square (256 px)."""
+    icon_dir = os.path.expanduser("~/.local/share/icons/hicolor/256x256/apps")
+    path = os.path.join(icon_dir, app_id + ".png")
+    if os.path.exists(path):
+        return
+    import cairo
+    img = cairo.ImageSurface.create_from_png(photo)
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, 256, 256)
+    cr = cairo.Context(s)
+    sc = 244 / max(img.get_width(), img.get_height())
+    cr.translate((256 - img.get_width() * sc) / 2, (256 - img.get_height() * sc) / 2)
+    cr.scale(sc, sc)
+    cr.set_source_surface(img, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_BEST)
+    cr.paint()
+    os.makedirs(icon_dir, exist_ok=True)
+    s.write_to_png(path)
+    # the drawn SVG of the kit would win over the PNG in the scalable folder: the photo icon replaces it here
+    try:
+        os.remove(os.path.expanduser(f"~/.local/share/icons/hicolor/scalable/apps/{app_id}.svg"))
+    except OSError:
+        pass
+    subprocess.run(["gtk-update-icon-cache", "-f", "-t", os.path.expanduser("~/.local/share/icons/hicolor")],
+                   capture_output=True)
+
+
+def prepare_photo(kind, i, spec):
+    """Download and prepare one product photo (once). Returns the path, or None (offline: the drawing is used)."""
+    path = photo_path(kind, i)
+    if os.path.exists(path):
+        return path
+    import urllib.request
+    from collections import deque
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    try:
+        req = urllib.request.Request(spec["url"], headers={"User-Agent": "Mozilla/5.0"})
+        data = urllib.request.urlopen(req, timeout=20).read()
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(data)
+        loader.close()
+        p = loader.get_pixbuf()
+    except Exception as e:   # offline, moved, or a format without a loader
+        print(f"photo for {kind}: {e}", file=sys.stderr)
+        return None
+    if spec.get("crop"):
+        x, y, w, h = spec["crop"]
+        p = p.new_subpixbuf(x, y, min(w, p.get_width() - x), min(h, p.get_height() - y)).copy()
+    if spec.get("height") and p.get_height() != spec["height"]:
+        s = spec["height"] / p.get_height()
+        p = p.scale_simple(round(p.get_width() * s), spec["height"], GdkPixbuf.InterpType.HYPER)
+    if not p.get_has_alpha():
+        p = p.add_alpha(False, 0, 0, 0)
+    W, H, rs = p.get_width(), p.get_height(), p.get_rowstride()
+    px = bytearray(p.get_pixels())
+    if spec.get("wipe"):
+        cond = eval("lambda x, y: " + spec["wipe"])
+        for y in range(H):
+            for x in range(W):
+                if cond(x, y):
+                    i = y * rs + x * 4
+                    px[i:i + 3] = b"\xff\xff\xff"
+    if spec.get("round"):   # the device's own rounded corners (the photo's background is a grey shade)
+        r = spec["round"]
+        for y in range(H):
+            for x in range(W):
+                dx = r - x if x < r else (x - (W - 1 - r) if x > W - 1 - r else 0)
+                dy = r - y if y < r else (y - (H - 1 - r) if y > H - 1 - r else 0)
+                if dx > 0 and dy > 0:
+                    d = math.hypot(dx, dy) - r
+                    if d > 0:
+                        px[y * rs + x * 4 + 3] = max(0, int(255 * (1 - d)))
+    seen = bytearray(W * H) if not spec.get("keep_bg") else bytearray(b"\x01") * (W * H)
+    q = deque() if spec.get("keep_bg") else deque([(x, 0) for x in range(W)] + [(x, H - 1) for x in range(W)] +
+              [(0, y) for y in range(H)] + [(W - 1, y) for y in range(H)])
+    while q:   # the white background, reached from the border, becomes transparent (soft edge)
+        x, y = q.popleft()
+        if x < 0 or y < 0 or x >= W or y >= H or seen[y * W + x]:
+            continue
+        seen[y * W + x] = 1
+        i = y * rs + x * 4
+        m = min(px[i], px[i + 1], px[i + 2])
+        if m <= 228:
+            continue
+        px[i + 3] = 0 if m > 242 else int(255 * (242 - m) / 14)
+        q.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+    out = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(px)), GdkPixbuf.Colorspace.RGB, True, 8, W, H, rs)
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    out.savev(path + ".tmp.png", "png", [], [])
+    if spec.get("outline"):   # a photo with a scene behind the device: keep only the traced outline
+        import cairo
+        img = cairo.ImageSurface.create_from_png(path + ".tmp.png")
+        cut = cairo.ImageSurface(cairo.FORMAT_ARGB32, img.get_width(), img.get_height())
+        cr = cairo.Context(cut)
+        pts = spec["outline"]
+        cr.move_to(*pts[0])
+        for pt in pts[1:]:
+            cr.line_to(*pt)
+        cr.close_path()
+        cr.clip()
+        cr.set_source_surface(img, 0, 0)
+        cr.paint()
+        cut.write_to_png(path + ".tmp.png")
+    os.replace(path + ".tmp.png", path)
+    return path
+
+
+def shape_path(cr, kind, g):
+    if kind == "rect":
+        cr.rectangle(*g)
+    elif kind == "poly":
+        cr.move_to(*g[0])
+        for pt in g[1:]:
+            cr.line_to(*pt)
+        cr.close_path()
+    else:
+        cx, cy, rx, ry = g
+        cr.save()
+        cr.translate(cx, cy)
+        cr.scale(rx, ry)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.restore()
+
+
+def point_in(kind, g, x, y):
+    if kind == "rect":
+        gx, gy, gw, gh = g
+        return gx <= x <= gx + gw and gy <= y <= gy + gh
+    if kind == "ellipse":
+        cx, cy, rx, ry = g
+        return ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1
+    inside = False
+    for i in range(len(g)):
+        (x1, y1), (x2, y2) = g[i], g[i - 1]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+            inside = not inside
+    return inside
+
+
+# ------------------------------------------------------------------ drawings of the devices
+class DeviceDrawing(Gtk.DrawingArea):
+    """The selected device seen from above, in design units 300 x 330 (scaled to fit)."""
+
+    def __init__(self, on_click):
+        super().__init__(content_width=440, content_height=460, hexpand=False)
+        self.kind = None
+        self.on_click = on_click
+        self.selected = None
+        self.highlight = None      # calibration / learning: control asked for
+        self.flash = {}
+        self.hover = None
+        self.accent = rgba("#cba6f7")   # the Noctalia Purple palette's accent
+        self.photo = None               # cairo surfaces of the product photos, when ready
+        self.photo_pending = True
+        self.set_draw_func(self.draw)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.clicked)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y: self.set_hover(self.hit(x, y)))
+        motion.connect("leave", lambda *_: self.set_hover(None))
+        self.add_controller(motion)
+
+    def set_photo(self, paths):
+        import cairo
+        self.photo_pending = False
+        try:
+            self.photo = [cairo.ImageSurface.create_from_png(p) for p in paths] if paths else None
+        except Exception:
+            self.photo = None
+        self.queue_draw()
+        return False
+
+    GAP = 18
+
+    def photo_layout(self, width, height):
+        """(scale, x, y) of each photo, stacked top to bottom and centred: each one as wide as the column
+        allows (at most 1.3x its size), all shrunk together when they do not fit the height."""
+        ws = [p.get_width() for p in self.photo]
+        hs = [p.get_height() for p in self.photo]
+        gaps = self.GAP * (len(hs) - 1)
+        scs = [min(width * 0.96 / w, 1.3) for w in ws]
+        total = sum(h * s for h, s in zip(hs, scs))
+        if total > (height - gaps) * 0.97:
+            k = (height - gaps) * 0.97 / total
+            scs = [s * k for s in scs]
+            total *= k
+        y = (height - total - gaps) / 2
+        out = []
+        for w, h, s in zip(ws, hs, scs):
+            out.append((s, (width - w * s) / 2, y))
+            y += h * s + self.GAP
+        return out
+
+    def blocked(self):
+        d = D.DEVICES[self.kind]
+        return d.get("silent", []) + d.get("fixed", [])
+
+    def photo_hit(self, px, py):
+        for (sc, ox, oy), spots in zip(self.photo_layout(self.get_width(), self.get_height()), HOT[self.kind]):
+            x, y = (px - ox) / sc, (py - oy) / sc
+            # small areas first (tilt, knob press), the knob ring last (it can lie over keys)
+            for cid in sorted(spots, key=lambda c: (c == "knob", not c.startswith(("tilt", "knob_press")))):
+                if cid in self.blocked():
+                    continue
+                if point_in(*spots[cid], x, y):
+                    return cid
+        return None
+
+    def hit(self, px, py):
+        if self.photo is not None and self.kind in HOT:
+            return self.photo_hit(px, py)
+        return None
+
+    def clicked(self, _g, _n, x, y):
+        cid = self.hit(x, y)
+        if cid:
+            self.on_click(cid)
+
+    def set_hover(self, cid):
+        if cid != self.hover:
+            self.hover = cid
+            self.set_cursor(Gdk.Cursor.new_from_name("pointer" if cid else "default"))
+            self.queue_draw()
+
+    def pulse(self, cid):
+        self.flash[cid] = time.monotonic()
+        self.queue_draw()
+        GLib.timeout_add(350, lambda: (self.queue_draw(), False)[1])
+
+    def flashing(self, cid):
+        return cid in self.flash and time.monotonic() - self.flash[cid] < 0.33
+
+    def state_color(self, cid):
+        if self.flashing(cid):
+            return rgba("#f9e2af", 0.85)
+        if cid == self.highlight:
+            return rgba("#f38ba8", 0.75)
+        if self.selected == cid or (cid == "knob" and self.selected in ("knob_right", "knob_left")):
+            return (*self.accent[:3], 0.75)
+        if cid == self.hover:
+            return (*self.accent[:3], 0.25)
+        return None
+
+    def draw(self, _area, cr, width, height):
+        if self.photo is not None and self.kind in HOT:
+            self.draw_photo(cr, width, height)
+            return
+        # the photo is downloaded and prepared on first start (needs the internet once)
+        cr.set_source_rgba(1, 1, 1, 0.5)
+        cr.select_font_face("Sans", 0, 0)
+        cr.set_font_size(14)
+        msg = "Loading the device photo…" if self.photo_pending else "No photo (offline?): the list on the right works"
+        ext = cr.text_extents(msg)
+        cr.move_to((width - ext.width) / 2, height / 2)
+        cr.show_text(msg)
+
+    def draw_photo(self, cr, width, height):
+        """The product photos with the buttons as areas: faint outline, hover, selection, presses, locks."""
+        for (sc, ox, oy), img, spots in zip(self.photo_layout(width, height), self.photo, HOT[self.kind]):
+            cr.save()
+            cr.translate(ox, oy)
+            cr.scale(sc, sc)
+            cr.set_source_surface(img, 0, 0)
+            cr.get_source().set_filter(4)   # cairo.FILTER_BEST
+            cr.paint()
+            self.draw_spots(cr, spots, sc)
+            cr.restore()
+
+    def draw_spots(self, cr, spots, sc):
+        knob = spots.get("knob")
+        lw = 1.4 / sc
+        for cid, (kind, g) in spots.items():
+            if cid == "knob":
+                continue
+            cr.save()
+            if knob and cid != "knob_press" and not cid.startswith("tilt"):   # keys stop at the knob's edge
+                cr.rectangle(-10000, -10000, 20000, 20000)
+                shape_path(cr, *knob)
+                cr.set_fill_rule(1)   # even-odd: everything except the knob
+                cr.clip()
+                cr.set_fill_rule(0)
+            if cid in self.blocked():
+                shape_path(cr, kind, g)
+                cr.set_source_rgba(0.08, 0.08, 0.1, 0.62)
+                cr.fill()
+                cr.restore()
+                self.padlock(cr, kind, g, sc)
+                continue
+            col = self.state_color(cid)
+            shape_path(cr, kind, g)
+            if col:
+                cr.set_source_rgba(col[0], col[1], col[2], min(col[3], 0.55))
+                cr.fill_preserve()
+                cr.set_source_rgba(col[0], col[1], col[2], 1)
+                cr.set_line_width(2 * lw)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.16)
+                cr.set_line_width(lw)
+            cr.stroke()
+            cr.restore()
+        if knob:
+            kind, g = knob
+            col = self.state_color("knob")
+            shape_path(cr, kind, g)
+            if col:
+                cr.set_source_rgba(col[0], col[1], col[2], 0.28)
+                cr.fill_preserve()
+                cr.set_source_rgba(col[0], col[1], col[2], 1)
+                cr.set_line_width(2 * lw)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.16)
+                cr.set_line_width(lw)
+            cr.stroke()
+            # turn arrows on both sides of the knob
+            cx, cy, rx, ry = g
+            for cid, d in (("knob_right", 1), ("knob_left", -1)):
+                if cid not in dict(D.DEVICES[self.kind]["controls"]):
+                    continue
+                flash = self.flashing(cid)
+                active = flash or self.selected == cid
+                cr.set_source_rgba(*(rgba("#f9e2af") if flash else (self.accent if active else (1, 1, 1, 0.55))))
+                cr.set_line_width(4 * lw)
+                cr.save()
+                cr.translate(cx, cy)
+                cr.scale(rx + 16 / sc, ry + 16 / sc)
+                a0, a1 = (-0.4, 0.4) if d == 1 else (math.pi - 0.4, math.pi + 0.4)
+                cr.arc(0, 0, 1, a0, a1)
+                cr.restore()
+                cr.stroke()
+                a = a1 if d == 1 else a0
+                ax, ay = cx + (rx + 16 / sc) * math.cos(a), cy + (ry + 16 / sc) * math.sin(a)
+                k = 9 / sc
+                tx, ty = -math.sin(a) * d, math.cos(a) * d
+                cr.move_to(ax + tx * k, ay + ty * k)
+                cr.line_to(ax - math.cos(a) * k * 0.8, ay - math.sin(a) * k * 0.8)
+                cr.line_to(ax + math.cos(a) * k * 0.8, ay + math.sin(a) * k * 0.8)
+                cr.close_path()
+                cr.fill()
+
+    def padlock(self, cr, kind, g, sc):
+        if kind == "rect":
+            cx, cy = g[0] + g[2] / 2, g[1] + g[3] / 2
+        elif kind == "ellipse":
+            cx, cy = g[0], g[1]
+        else:
+            cx, cy = sum(p[0] for p in g) / len(g), sum(p[1] for p in g) / len(g)
+        s = 1.6 / sc
+        cr.set_source_rgba(0.85, 0.85, 0.9, 0.9)
+        rounded(cr, cx - 6 * s, cy - 1 * s, 12 * s, 9 * s, 2 * s)
+        cr.fill()
+        cr.set_line_width(2 * s)
+        cr.arc(cx, cy - 1 * s, 4 * s, math.pi, 2 * math.pi)
+        cr.stroke()
+
+# ------------------------------------------------------------------ the window
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, device):
+        name = D.DEVICES[device]["name"]
+        super().__init__(application=app, title=name, default_width=1360, default_height=820)
+        self.dev = device
+        self.conf = D.load_conf(device)
+        self.profile = "default"
+        self.selected = self.first_control(device)
+        self.recording = None
+        self.calib = None
+        self.calib_found = {}
+        self.learning = None
+        self.connected = {}
+        self.apps = sorted([a for a in Gio.AppInfo.get_all() if isinstance(a, DesktopAppInfo) and a.should_show()],
+                           key=lambda a: a.get_display_name().lower())
+
+        self.toasts = Adw.ToastOverlay()
+        tv = Adw.ToolbarView()
+        head = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title=name, subtitle="")
+        head.set_title_widget(self.title)
+        sw_box = Gtk.Box(spacing=8)
+        sw_box.append(Gtk.Label(label="Use these settings"))
+        self.enable = Gtk.Switch(active=self.conf.get("enabled", True), valign=Gtk.Align.CENTER,
+                                 tooltip_text="Off: the device sends its own keys")
+        self.enable.connect("notify::active", self.on_enable)
+        sw_box.append(self.enable)
+        head.pack_end(sw_box)
+        tv.add_top_bar(head)
+        self.banner = Adw.Banner(title=f"The {name} service is not running", button_label="Start it")
+        self.banner.connect("button-clicked", self.start_service)
+        tv.add_top_bar(self.banner)
+
+        # three columns: the device (photos, full height) | profile + list of controls | the selected control
+        body = Gtk.Box()
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=10, margin_bottom=10,
+                       margin_start=14, margin_end=10, width_request=600, hexpand=False)
+        self.model_label = Gtk.Label(css_classes=["dim-label"], xalign=0.5)
+        left.append(self.model_label)
+        self.drawing = DeviceDrawing(self.select)
+        self.drawing.set_vexpand(True)
+        self.drawing.set_hexpand(True)
+        left.append(self.drawing)
+        self.hint = Gtk.Label(label="Click a control, or press it on the device.", css_classes=["dim-label"], wrap=True)
+        left.append(self.hint)
+        crow = Gtk.Box(spacing=6, homogeneous=False)
+        self.calib_btn = Gtk.Button(css_classes=["flat"], hexpand=True,
+                                    tooltip_text="Press each key when asked: the app learns which key sends what")
+        self.calib_btn.connect("clicked", self.start_calibration)
+        crow.append(self.calib_btn)
+        self.skip_btn = Gtk.Button(label="Skip this key", visible=False,
+                                   tooltip_text="For a key that sends nothing (it works only inside the device)")
+        self.skip_btn.connect("clicked", lambda *_: self.calibration_next())
+        crow.append(self.skip_btn)
+        left.append(crow)
+        body.append(left)
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12,
+                      margin_start=12, margin_end=12, width_request=300, hexpand=False)
+        prow = Gtk.Box(spacing=6)
+        prow.append(Gtk.Label(label="Profile", css_classes=["heading"]))
+        self.profiles_model = Gtk.StringList()
+        self.profile_dd = Gtk.DropDown(model=self.profiles_model, hexpand=True)
+        self.profile_dd.connect("notify::selected", self.on_profile)
+        prow.append(self.profile_dd)
+        add = Gtk.MenuButton(icon_name="list-add-symbolic", tooltip_text="Settings for one app (used while it is focused)")
+        add.set_popover(self.app_popover())
+        prow.append(add)
+        self.del_btn = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete this app profile")
+        self.del_btn.connect("clicked", self.delete_profile)
+        prow.append(self.del_btn)
+        mid.append(prow)
+        self.overview = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE, valign=Gtk.Align.START)
+        self.overview.connect("row-activated", lambda _l, r: self.select(r.cid))
+        mid.append(Gtk.ScrolledWindow(child=self.overview, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        body.append(mid)
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        self.right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        body.append(self.right)
+        tv.set_content(body)
+        self.toasts.set_child(tv)
+        self.set_content(self.toasts)
+
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        if os.environ.get("MACRO_KEYS_SELECT") and \
+                os.environ["MACRO_KEYS_SELECT"] not in D.DEVICES[self.dev].get("silent", []):   # testing
+            self.selected = os.environ["MACRO_KEYS_SELECT"]
+        self.set_device(self.dev, keep_selection=True)
+        threading.Thread(target=self.listen, daemon=True).start()
+        GLib.timeout_add_seconds(30, self.update_status)
+
+    # ---------------------------------------------------------- devices
+    def dconf(self):
+        return self.conf["devices"][self.dev]
+
+    def controls(self):
+        return D.DEVICES[self.dev]["controls"]
+
+    def label(self, cid):
+        return dict(self.controls()).get(cid, cid)
+
+    def set_device(self, kind, keep_selection=False):
+        if kind == self.dev and not keep_selection:
+            return
+        self.dev = kind
+        self.profile = "default"
+        if not keep_selection or self.selected not in dict(self.controls()) or self.silent(self.selected):
+            self.selected = self.first_control(kind)
+        self.recording = self.learning = None
+        self.calib = None
+        self.drawing.kind = kind
+        self.drawing.highlight = None
+        paths = [photo_path(kind, i) for i in range(len(PHOTOS.get(kind, [])))]
+        if paths and all(os.path.exists(p) for p in paths) and (kind not in PHOTO_ICONS or os.path.exists(
+                os.path.expanduser(f"~/.local/share/icons/hicolor/256x256/apps/{PHOTO_ICONS[kind]}.png"))):
+            self.drawing.set_photo(paths)
+        else:   # first start: download and prepare (also makes the launcher icon of the trackballs)
+            threading.Thread(target=lambda: GLib.idle_add(self.drawing.set_photo, prepare_photos(kind)),
+                             daemon=True).start()
+        self.model_label.set_label(D.DEVICES[kind]["model"])
+        self.calib_btn.set_visible(kind in CALIBRATE)
+        if kind in CALIBRATE:
+            self.calib_btn.set_label(CALIBRATE[kind][0])
+        self.skip_btn.set_visible(False)
+        self.fill_profiles()
+        self.update_status()
+        self.refresh()
+
+    # ---------------------------------------------------------- service, events, status
+    def listen(self):
+        while True:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(D.sock_path(self.dev))
+                GLib.idle_add(self.banner.set_revealed, False)
+                buf = b""
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            GLib.idle_add(self.on_event, json.loads(line))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+            GLib.idle_add(self.banner.set_revealed, True)
+            GLib.idle_add(self.set_connected, {})
+            time.sleep(2)
+
+    def start_service(self, *_):
+        subprocess.run(["systemctl", "--user", "enable", "--now", APPS[self.dev][1]])
+
+    def set_connected(self, conn):
+        self.connected = conn
+        self.update_status()
+        return False
+
+    def update_status(self):
+        sub = "connected" if self.connected.get(self.dev) else "not connected"
+        bt = D.DEVICES[self.dev].get("bluetooth")
+        if bt and self.connected.get(self.dev):
+            try:
+                out = subprocess.run(["bluetoothctl", "devices", "Connected"], capture_output=True, text=True, timeout=3).stdout
+                mac = next((l.split()[1] for l in out.splitlines() if bt in l), None)
+                if mac:
+                    info = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, text=True, timeout=3).stdout
+                    for l in info.splitlines():
+                        if "Battery Percentage" in l and "(" in l:
+                            sub += f" · battery {l.rsplit('(', 1)[1].rstrip(')')} %"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        elif not self.connected.get(self.dev):
+            sub += " (switch it on / plug it in)"
+        self.title.set_subtitle(sub)
+        return True
+
+    def on_event(self, ev):
+        kind = ev.get("event")
+        if kind == "status":
+            self.set_connected(ev.get("connected") or {})
+        elif kind == "press":
+            dev = ev.get("device")
+            if self.calib is not None and dev == self.dev:
+                self.calibration_press(ev.get("signature"))
+                return False
+            if self.learning and dev == self.dev:
+                self.learned(ev.get("signature"))
+                return False
+            if dev != self.dev:
+                return False
+            cid = ev.get("control")
+            if cid:
+                self.drawing.pulse(cid)
+                if cid in ("knob_right", "knob_left"):
+                    self.drawing.pulse("knob")
+                if cid.startswith("tilt"):
+                    self.drawing.pulse("middle")
+                if self.selected != cid and not (cid in KNOB_IDS[:2] and self.selected in KNOB_IDS[:2]):
+                    self.select(cid)
+        return False
+
+    def on_enable(self, sw, _p):
+        self.conf["enabled"] = sw.get_active()
+        self.save()
+
+    def save(self):
+        D.save_conf(self.dev, self.conf)
+        self.fill_overview()
+
+    # ---------------------------------------------------------- profiles
+    def fill_profiles(self):
+        profs = self.dconf()["profiles"]
+        self.profile_keys = ["default"] + sorted(k for k in profs if k != "default")
+        names = ["All apps"]
+        for k in self.profile_keys[1:]:
+            app_id = k.split(":", 1)[1]
+            info = next((a for a in self.apps if a.get_id().removesuffix(".desktop") == app_id), None)
+            names.append(info.get_display_name() if info else app_id)
+        self.profiles_model.splice(0, self.profiles_model.get_n_items(), names)
+        self.profile_dd.set_selected(self.profile_keys.index(self.profile) if self.profile in self.profile_keys else 0)
+        self.del_btn.set_sensitive(self.profile != "default")
+
+    def on_profile(self, dd, _p):
+        i = dd.get_selected()
+        if 0 <= i < len(getattr(self, "profile_keys", [])):
+            self.profile = self.profile_keys[i]
+            self.del_btn.set_sensitive(self.profile != "default")
+            self.refresh()
+
+    def app_popover(self):
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=8, margin_bottom=8,
+                      margin_start=8, margin_end=8)
+        box.append(Gtk.Label(label="Settings that apply while this app is focused", css_classes=["dim-label"]))
+        search = Gtk.SearchEntry(placeholder_text="Search apps")
+        box.append(search)
+        lb = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        for a in self.apps:
+            row = Gtk.ListBoxRow()
+            row.app = a
+            h = Gtk.Box(spacing=8, margin_top=4, margin_bottom=4)
+            img = Gtk.Image(pixel_size=20)
+            if a.get_icon():
+                img.set_from_gicon(a.get_icon())
+            h.append(img)
+            h.append(Gtk.Label(label=a.get_display_name(), xalign=0))
+            row.set_child(h)
+            lb.append(row)
+        lb.set_filter_func(lambda r: search.get_text().lower() in r.app.get_display_name().lower())
+        search.connect("search-changed", lambda *_: lb.invalidate_filter())
+
+        def chosen(_l, row):
+            # profiles are keyed by the Wayland app_id, which is the launcher entry's name for most apps
+            key = "app:" + row.app.get_id().removesuffix(".desktop")
+            self.dconf()["profiles"].setdefault(key, {})
+            self.profile = key
+            self.save()
+            self.fill_profiles()
+            pop.popdown()
+        lb.connect("row-activated", chosen)
+        box.append(Gtk.ScrolledWindow(child=lb, min_content_height=320, min_content_width=280))
+        pop.set_child(box)
+        return pop
+
+    def delete_profile(self, *_):
+        if self.profile != "default":
+            self.dconf()["profiles"].pop(self.profile, None)
+            self.profile = "default"
+            self.save()
+            self.fill_profiles()
+            self.refresh()
+
+    # ---------------------------------------------------------- reading / writing actions
+    def get_action(self, cid):
+        prof = self.dconf()["profiles"].get(self.profile, {})
+        if cid in prof:
+            return prof[cid]
+        return {"type": "inherit"} if self.profile != "default" else {"type": "default"}
+
+    def set_action(self, cid, action):
+        prof = self.dconf()["profiles"].setdefault(self.profile, {})
+        if action.get("type") == "inherit" or (self.profile == "default" and action.get("type") == "default"):
+            prof.pop(cid, None)
+        else:
+            prof[cid] = action
+        self.save()
+
+    @staticmethod
+    def first_control(kind):
+        d = D.DEVICES[kind]
+        blocked = d.get("silent", []) + d.get("fixed", [])
+        return next(c for c, _ in d["controls"] if c not in blocked)
+
+    def silent(self, cid):
+        return cid in D.DEVICES[self.dev].get("silent", []) or cid in D.DEVICES[self.dev].get("fixed", [])
+
+    def summary(self, cid):
+        if cid in D.DEVICES[self.dev].get("fixed", []):
+            return "always left click (so the mouse stays usable)"
+        if self.silent(cid):
+            return "built into the device, cannot be changed"
+        a = self.get_action(cid)
+        if a.get("type") == "inherit":
+            base = self.dconf()["profiles"]["default"].get(cid, {"type": "default"})
+            return "as All apps: " + D.describe(self.conf, self.dev, cid, base)
+        return D.describe(self.conf, self.dev, cid, a)
+
+    # ---------------------------------------------------------- UI
+    def select(self, cid):
+        if self.silent(cid):
+            return
+        if cid == "knob":
+            cid = self.selected if self.selected in KNOB_IDS[:2] else "knob_right"
+        self.selected = cid
+        self.refresh()
+
+    def refresh(self):
+        self.drawing.selected = self.selected
+        self.drawing.queue_draw()
+        self.fill_overview()
+        child = self.right.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.right.remove(child)
+            child = nxt
+        page = Adw.PreferencesPage(vexpand=True)
+        if self.selected in KNOB_IDS[:2]:
+            g = Adw.PreferencesGroup(title="Knob", description=D.DEVICES[self.dev]["knob_note"] +
+                                     " Each step runs the action once.")
+            preset = Adw.ComboRow(title="Quick preset", subtitle="Sets both directions")
+            keys = list(D.KNOB_PRESETS)
+            preset.set_model(Gtk.StringList.new(["Choose…"] + [D.KNOB_PRESETS[k][0] for k in keys]))
+            preset.set_selected(0)
+
+            def on_preset(row, _p):
+                i = row.get_selected()
+                if i > 0:
+                    _, right, left = D.KNOB_PRESETS[keys[i - 1]]
+                    self.set_action("knob_right", dict(right))
+                    self.set_action("knob_left", dict(left))
+                    GLib.idle_add(self.refresh)
+            preset.connect("notify::selected", on_preset)
+            g.add(preset)
+            page.add(g)
+            page.add(self.action_group("knob_right", "Turn right ↻"))
+            page.add(self.action_group("knob_left", "Turn left ↺"))
+            if "knob_press" in dict(self.controls()):
+                page.add(self.action_group("knob_press", "Press"))
+        elif self.silent(self.selected):
+            page.add(Adw.PreferencesGroup(title=self.label(self.selected),
+                                          description=D.DEVICES[self.dev].get("silent_note", "This key sends nothing.")))
+        else:
+            sig = D.control_signature(self.conf, self.dev, self.selected)
+            desc = (f"On its own it sends: {D.pretty_signature(sig)}" if sig else
+                    D.DEVICES[self.dev].get("silent_note", "On its own it sends nothing yet. Press “Learn this key” "
+                                            "and then the key; if nothing arrives, the key has no function stored in the device."))
+            page.add(self.action_group(self.selected, self.label(self.selected), desc, learn=bool(D.DEVICES[self.dev].get("learn"))))
+        self.right.append(page)
+
+    def fill_overview(self):
+        self.overview.remove_all()
+        for cid, label in self.controls():
+            silent = self.silent(cid)
+            row = Adw.ActionRow(title=label, subtitle=self.summary(cid), activatable=not silent, sensitive=not silent)
+            row.cid = cid
+            if silent:
+                row.add_prefix(Gtk.Image(icon_name="changes-prevent-symbolic", css_classes=["dim-label"]))
+            if cid == self.selected:
+                row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            self.overview.append(row)
+
+    def action_group(self, cid, title, description=None, learn=False):
+        g = Adw.PreferencesGroup(title=title, description=description)
+        if learn:
+            lb = Gtk.Button(label="Listening… press the key" if self.learning == cid else "Learn this key",
+                            valign=Gtk.Align.CENTER, css_classes=["flat"])
+            lb.connect("clicked", lambda *_: self.start_learning(cid))
+            g.set_header_suffix(lb)
+        action = self.get_action(cid)
+        types = ([INHERIT] if self.profile != "default" else []) + TYPES
+        combo = Adw.ComboRow(title="Does")
+        combo.set_model(Gtk.StringList.new([t[1] for t in types]))
+        ids = [t[0] for t in types]
+        combo.set_selected(ids.index(action.get("type", "default")) if action.get("type", "default") in ids else 0)
+
+        def on_type(row, _p):
+            t = ids[row.get_selected()]
+            if t == action.get("type"):
+                return
+            new = {"type": t}
+            if t == "action":
+                new["id"] = next(iter(D.ACTIONS))
+            self.set_action(cid, new)
+            GLib.idle_add(self.refresh)
+        combo.connect("notify::selected", on_type)
+        g.add(combo)
+        t = action.get("type", "default")
+
+        if t == "keys":
+            row = Adw.ActionRow(title="Shortcut", subtitle=D.pretty_combo(action.get("keys", "")) or "not set")
+            rec = Gtk.Button(label="Press the keys…" if self.recording == cid else "Record",
+                             valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+
+            def start_rec(_b):
+                self.recording = cid
+                rec.set_label("Press the keys…")
+                row.set_subtitle("Press the shortcut now (Esc cancels)")
+            rec.connect("clicked", start_rec)
+            row.add_suffix(rec)
+            g.add(row)
+            entry = Adw.EntryRow(title="…or type it (e.g. ctrl+shift+z, super+e, f5)", text=action.get("keys", ""))
+            entry.set_show_apply_button(True)
+
+            def typed(e):
+                try:
+                    D.parse_combo(e.get_text())
+                    self.set_action(cid, {"type": "keys", "keys": e.get_text().lower().replace(" ", "")})
+                    GLib.idle_add(self.refresh)
+                except ValueError as err:
+                    self.toasts.add_toast(Adw.Toast(title=str(err), timeout=3))
+            entry.connect("apply", typed)
+            g.add(entry)
+        elif t == "action":
+            keys = list(D.ACTIONS)
+            row = Adw.ComboRow(title="Action", enable_search=True)
+            row.set_model(Gtk.StringList.new([f"{D.ACTIONS[k][0]} · {D.ACTIONS[k][1]}" for k in keys]))
+            row.set_selected(keys.index(action["id"]) if action.get("id") in keys else 0)
+            row.connect("notify::selected", lambda r, _p: self.set_action(cid, {"type": "action", "id": keys[r.get_selected()]}))
+            g.add(row)
+        elif t == "app":
+            row = Adw.ComboRow(title="App", enable_search=True)
+            row.set_model(Gtk.StringList.new([a.get_display_name() for a in self.apps]))
+            ids_ = [a.get_id() for a in self.apps]
+            row.set_selected(ids_.index(action["app"]) if action.get("app") in ids_ else Gtk.INVALID_LIST_POSITION)
+
+            def on_app(r, _p):
+                i = r.get_selected()
+                if 0 <= i < len(self.apps):
+                    self.set_action(cid, {"type": "app", "app": ids_[i], "name": self.apps[i].get_display_name()})
+            row.connect("notify::selected", on_app)
+            g.add(row)
+        elif t == "command":
+            entry = Adw.EntryRow(title="Command (runs with sh)", text=action.get("command", ""))
+            entry.set_show_apply_button(True)
+            entry.connect("apply", lambda e: self.set_action(cid, {"type": "command", "command": e.get_text()}))
+            g.add(entry)
+        elif t == "text":
+            entry = Adw.EntryRow(title="Text to type (US layout characters)", text=action.get("text", ""))
+            entry.set_show_apply_button(True)
+            entry.connect("apply", lambda e: self.set_action(cid, {"type": "text", "text": e.get_text()}))
+            g.add(entry)
+
+        if t not in ("none", "inherit"):
+            test = Adw.ButtonRow(title="Try it", start_icon_name="media-playback-start-symbolic")
+            test.connect("activated", lambda *_: self.try_action(cid))
+            g.add(test)
+        return g
+
+    def try_action(self, cid):
+        """The service runs it, exactly as a press would (shortcuts go to the focused window: this one)."""
+        try:
+            D.test_action(self.dev, cid)
+        except OSError:
+            self.toasts.add_toast(Adw.Toast(title="The service is not running", timeout=3))
+
+    # ---------------------------------------------------------- shortcut recording
+    def on_key(self, _ctl, keyval, keycode, state):
+        if self.recording is None:
+            return False
+        cid = self.recording
+        name = Gdk.keyval_name(keyval) or ""
+        if name == "Escape":
+            self.recording = None
+            self.refresh()
+            return True
+        if name in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R", "Super_L", "Super_R",
+                    "Meta_L", "Meta_R", "ISO_Level3_Shift"):
+            return True   # wait for the real key
+        kname = D.NAMES.get(keycode - 8)
+        if not kname:
+            return True
+        parts = []
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            parts.append("ctrl")
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            parts.append("shift")
+        if state & Gdk.ModifierType.ALT_MASK:
+            parts.append("alt")
+        if state & Gdk.ModifierType.SUPER_MASK:
+            parts.append("super")
+        parts.append(kname.removeprefix("KEY_").lower())
+        combo = "+".join(parts)
+        self.recording = None
+        self.set_action(cid, {"type": "keys", "keys": combo})
+        self.toasts.add_toast(Adw.Toast(title=f"Shortcut: {D.pretty_combo(combo)}", timeout=2))
+        self.refresh()
+        return True
+
+    # ---------------------------------------------------------- learning a key
+    def start_learning(self, cid):
+        if not self.connected.get(self.dev):
+            self.toasts.add_toast(Adw.Toast(title="Connect the device first", timeout=3))
+            return
+        self.learning = cid
+        self.drawing.highlight = cid
+        self.hint.set_label(f"Press {self.label(cid)} on the device…")
+        self.hint.set_css_classes(["accent"])
+        self.refresh()
+        token = object()
+        self._learn_token = token
+        GLib.timeout_add_seconds(10, lambda: self.learn_timeout(token))
+
+    def learn_timeout(self, token):
+        if self.learning and getattr(self, "_learn_token", None) is token:
+            cid = self.learning
+            self.end_learning()
+            self.toasts.add_toast(Adw.Toast(title=f"{self.label(cid)} sent nothing: it has no function stored in "
+                                                  "the device yet (program it first)", timeout=6))
+        return False
+
+    def learned(self, sig):
+        cid = self.learning
+        if not sig:
+            return
+        m = self.dconf()["map"]
+        for k in [k for k, v in m.items() if v == cid or k == sig]:
+            m.pop(k)
+        m[sig] = cid
+        self.end_learning()
+        self.save()
+        self.refresh()
+        self.toasts.add_toast(Adw.Toast(title=f"{self.label(cid)} sends {D.pretty_signature(sig)}", timeout=3))
+
+    def end_learning(self):
+        self.learning = None
+        self.drawing.highlight = None
+        self.hint.set_label("Click a control, or press it on the device.")
+        self.hint.set_css_classes(["dim-label"])
+        self.refresh()
+
+    # ---------------------------------------------------------- "which key is which?"
+    def start_calibration(self, *_):
+        if not self.connected.get(self.dev):
+            self.toasts.add_toast(Adw.Toast(title="Connect the device first", timeout=3))
+            return
+        self.calib = 0
+        self.calib_found = {}
+        self.skip_btn.set_visible(True)
+        self.ask_calibration()
+
+    def ask_calibration(self):
+        while self.calib < len(CALIBRATE[self.dev][1]) and self.silent(CALIBRATE[self.dev][1][self.calib][0]):
+            self.calib += 1
+        if self.calib >= len(CALIBRATE[self.dev][1]):
+            self.calib -= 1
+            self.calibration_next()
+            return
+        pos, text = CALIBRATE[self.dev][1][self.calib]
+        self.drawing.highlight = pos
+        self.drawing.queue_draw()
+        self.hint.set_label(f"Press {text}.  (It still does its job while you press it.)")
+        self.hint.set_css_classes(["accent"])
+
+    def calibration_press(self, sig):
+        # knob turns / presses and keys already placed in this round do not count
+        current = self.dconf()["map"].get(sig) or ""
+        if not sig or sig in self.calib_found or current.startswith(("knob", "tilt")) or \
+                current in ("left", "right", "middle"):
+            return
+        self.calib_found[sig] = CALIBRATE[self.dev][1][self.calib][0]
+        self.calibration_next()
+
+    def calibration_next(self):
+        self.calib += 1
+        if self.calib < len(CALIBRATE[self.dev][1]):
+            self.ask_calibration()
+            return
+        m = self.dconf()["map"]
+        for sig, cid in self.calib_found.items():
+            for k in [k for k, v in m.items() if v == cid or k == sig]:
+                m.pop(k)
+            m[sig] = cid
+        self.calib = None
+        self.skip_btn.set_visible(False)
+        self.drawing.highlight = None
+        self.hint.set_label("Click a control, or press it on the device.")
+        self.hint.set_css_classes(["dim-label"])
+        self.save()
+        self.refresh()
+        self.toasts.add_toast(Adw.Toast(title="Keys learned", timeout=3))
+
+
+class App(Adw.Application):
+    def __init__(self, device):
+        super().__init__(application_id=APPS[device][0], flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.device = device
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self, self.device)
+        win.present()
+
+
+if __name__ == "__main__":
+    dev = sys.argv[sys.argv.index("--device") + 1] if "--device" in sys.argv else None
+    if dev not in APPS:
+        print(__doc__)
+        sys.exit(2)
+    sys.exit(App(dev).run(sys.argv[:1]))

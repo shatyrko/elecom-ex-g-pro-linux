@@ -1,0 +1,3 @@
+# macro-keys: the device apps' services send keys and pointer events through /dev/uinput as the
+# user (group input, like /dev/input/event*). Installed by install.sh.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""macro-keys - remaps a small macro device (keypad, dial, mouse, trackball) on Linux.
+
+Each device has a description file (~/.local/share/macro-keys/devices/<id>.py) and its own app
+(macro-keys-studio --device <id>) and service (this program, one per device). The service reads
+the device's own input devices, takes them over (EVIOCGRAB: only those, never the real keyboard)
+and turns every press into what is set for it: the original key, any shortcut, a desktop action,
+an app, a command or typed text. Mice and trackballs: movement and scrolling pass straight
+through a virtual mouse, unchanged buttons too (held for dragging). Per-app profiles: the focused
+window's app_id (Umbriel compositor) picks a profile, falling back to "default".
+
+No extra packages: raw evdev reading and a uinput virtual device through ioctl (the user is in
+the `input` group and /dev/uinput is group-writable; see the udev rule of the repository).
+
+  macro-keys --device <id>              run (one systemd user unit per device)
+  macro-keys --test <id> <control>      ask that running service to run a control's action
+
+Settings: ~/.config/macro-keys/<id>.json (reloaded when it changes). Live events for the app:
+Unix socket $XDG_RUNTIME_DIR/macro-keys-<id>.sock, one JSON object per line.
+"""
+import fcntl, glob, json, os, re, select, socket, struct, subprocess, sys, time
+
+CONF_DIR = os.path.expanduser("~/.config/macro-keys")
+
+
+def conf_path(kind):
+    return os.path.join(CONF_DIR, f"{kind}.json")
+
+
+def sock_path(kind):
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"macro-keys-{kind}.sock")
+EVENT = struct.Struct("llHHi")
+EV_SYN, EV_KEY, EV_REL = 0, 1, 2
+REL_HWHEEL, REL_HWHEEL_HI_RES = 0x06, 0x0c
+EVIOCGRAB = 0x40044590
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
+UI_DEV_SETUP, UI_DEV_CREATE = 0x405C5503, 0x5501
+
+# ------------------------------------------------------------------ the devices
+# One description file per device (devices/<id>.py: DEVICE = {...}, plain data) in
+# ~/.local/share/macro-keys/devices (or $MACRO_KEYS_DEVICES). Each device's repository installs
+# its own file; this engine is the same for all of them.
+DEVICE_DIR = os.environ.get("MACRO_KEYS_DEVICES") or os.path.expanduser("~/.local/share/macro-keys/devices")
+
+
+def load_devices():
+    import ast
+    found = {}
+    for f in sorted(glob.glob(os.path.join(DEVICE_DIR, "*.py"))):
+        try:
+            tree = ast.parse(open(f).read(), f)
+            node = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                        and any(getattr(t, "id", None) == "DEVICE" for t in n.targets))
+            dev = ast.literal_eval(node)   # data only: a device file cannot run code
+            found[dev["id"]] = dev
+        except (OSError, SyntaxError, ValueError, StopIteration, KeyError) as e:
+            print(f"device file {f}: {e}", file=sys.stderr)
+    return found
+
+
+DEVICES = load_devices()
+# what a device sends, in words (shown in the app); generic names, then each device's own
+SENDS = {"BTN_LEFT": "Left click", "BTN_RIGHT": "Right click", "BTN_MIDDLE": "Middle click (wheel)",
+         "BTN_SIDE": "Back", "BTN_EXTRA": "Forward", "BTN_FORWARD": "Button 10", "BTN_BACK": "Button 11",
+         "BTN_TASK": "Button 12", "REL_HWHEEL-": "Scroll left", "REL_HWHEEL+": "Scroll right",
+         "KEY_VOLUMEUP": "Volume up", "KEY_VOLUMEDOWN": "Volume down", "KEY_MUTE": "Mute"}
+for _d in DEVICES.values():
+    SENDS.update(_d.get("sends", {}))
+
+# desktop actions offered in the app: id -> (group, label, argv)
+NM, UM = ["noctalia", "msg"], ["umbriel", "msg"]
+ACTIONS = {
+    "volume-up": ("Sound", "Volume up", NM + ["volume-up"]),
+    "volume-down": ("Sound", "Volume down", NM + ["volume-down"]),
+    "volume-mute": ("Sound", "Mute / unmute", NM + ["volume-mute"]),
+    "mic-mute": ("Sound", "Microphone mute", NM + ["mic-mute"]),
+    "media-toggle": ("Media", "Play / pause", NM + ["media", "toggle"]),
+    "media-next": ("Media", "Next track", NM + ["media", "next"]),
+    "media-previous": ("Media", "Previous track", NM + ["media", "previous"]),
+    "brightness-up": ("Screen", "Brightness up", NM + ["brightness-up"]),
+    "brightness-down": ("Screen", "Brightness down", NM + ["brightness-down"]),
+    "screens-off": ("Screen", "Screens off", ["sh", "-c", "sleep 0.3; exec noctalia msg dpms-off"]),
+    "nightlight": ("Screen", "Night light on / off", NM + ["nightlight-force-toggle"]),
+    "screenshot-region": ("Screenshot", "Screenshot of a region", NM + ["screenshot-region"]),
+    "screenshot-full": ("Screenshot", "Screenshot of the screen", NM + ["screenshot-fullscreen"]),
+    "screenshot-annotate": ("Screenshot", "Screenshot and draw on it", NM + ["screenshot-annotate"]),
+    "workspace-next": ("Desktops and windows", "Next desktop", UM + ["workspace-next"]),
+    "workspace-previous": ("Desktops and windows", "Previous desktop", UM + ["workspace-previous"]),
+    "window-right": ("Desktops and windows", "Window to the right", UM + ["window-focus-right"]),
+    "window-left": ("Desktops and windows", "Window to the left", UM + ["window-focus-left"]),
+    "overview": ("Desktops and windows", "Overview", UM + ["overview-toggle"]),
+    "maximize": ("Desktops and windows", "Full width on / off", UM + ["window-toggle-maximize"]),
+    "fullscreen": ("Desktops and windows", "Fullscreen on / off", UM + ["window-toggle-fullscreen"]),
+    "floating": ("Desktops and windows", "Float / tile the window", UM + ["window-toggle-floating:"]),
+    "close-window": ("Desktops and windows", "Close the window", UM + ["window-close:"]),
+    "launcher": ("Noctalia", "App launcher", NM + ["panel-toggle", "launcher"]),
+    "control-center": ("Noctalia", "Control center", NM + ["panel-toggle", "control-center"]),
+    "clipboard": ("Noctalia", "Clipboard history", NM + ["panel-toggle", "clipboard"]),
+    "notifications-dnd": ("Noctalia", "Do not disturb on / off", NM + ["notification-dnd-toggle"]),
+    "wallpaper-next": ("Noctalia", "Next wallpaper", NM + ["wallpaper-next"]),
+    "lock": ("Session", "Lock the screen", NM + ["session", "lock"]),
+    "suspend": ("Session", "Sleep", NM + ["session", "suspend"]),
+    "power-cycle": ("Session", "Next power profile", NM + ["power-cycle"]),
+}
+
+# knob presets: (right, left) actions
+KNOB_PRESETS = {
+    "volume": ("Volume", {"type": "action", "id": "volume-up"}, {"type": "action", "id": "volume-down"}),
+    "brightness": ("Brightness", {"type": "action", "id": "brightness-up"}, {"type": "action", "id": "brightness-down"}),
+    "windows": ("Scroll through windows", {"type": "action", "id": "window-right"}, {"type": "action", "id": "window-left"}),
+    "desktops": ("Switch desktops", {"type": "action", "id": "workspace-next"}, {"type": "action", "id": "workspace-previous"}),
+    "zoom": ("Zoom (Ctrl + / Ctrl −)", {"type": "keys", "keys": "ctrl+equal"}, {"type": "keys", "keys": "ctrl+minus"}),
+    "scroll": ("Scroll the page (Page Down / Up)", {"type": "keys", "keys": "pagedown"}, {"type": "keys", "keys": "pageup"}),
+    "arrows": ("Arrow right / left", {"type": "keys", "keys": "right"}, {"type": "keys", "keys": "left"}),
+    "undo": ("Redo / Undo", {"type": "keys", "keys": "ctrl+shift+z"}, {"type": "keys", "keys": "ctrl+z"}),
+    "tracks": ("Next / previous track", {"type": "action", "id": "media-next"}, {"type": "action", "id": "media-previous"}),
+}
+
+
+# ------------------------------------------------------------------ key names
+def key_codes():
+    codes = {}
+    try:
+        for line in open("/usr/include/linux/input-event-codes.h"):
+            m = re.match(r"#define\s+(KEY_\w+|BTN_\w+)\s+(0x[0-9a-fA-F]+|\d+)\b", line)
+            if m:
+                codes.setdefault(m.group(1), int(m.group(2), 0))
+    except OSError:
+        pass
+    return codes
+
+
+CODES = key_codes()
+NAMES = {}
+for _n, _c in CODES.items():
+    NAMES.setdefault(_c, _n)
+# modifier keys -> signature prefix, in this order
+MOD_ORDER = [("CTRL", ("KEY_LEFTCTRL", "KEY_RIGHTCTRL")), ("SHIFT", ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT")),
+             ("ALT", ("KEY_LEFTALT", "KEY_RIGHTALT")), ("META", ("KEY_LEFTMETA", "KEY_RIGHTMETA"))]
+MOD_OF = {CODES[k]: m for m, ks in MOD_ORDER for k in ks if k in CODES}
+MOD_KEY = {"CTRL": "KEY_LEFTCTRL", "SHIFT": "KEY_LEFTSHIFT", "ALT": "KEY_LEFTALT", "META": "KEY_LEFTMETA"}
+MODS = {"ctrl": "KEY_LEFTCTRL", "control": "KEY_LEFTCTRL", "shift": "KEY_LEFTSHIFT", "alt": "KEY_LEFTALT",
+        "super": "KEY_LEFTMETA", "meta": "KEY_LEFTMETA", "win": "KEY_LEFTMETA", "altgr": "KEY_RIGHTALT"}
+ALIASES = {"plus": "KEY_EQUAL", "=": "KEY_EQUAL", "-": "KEY_MINUS", "return": "KEY_ENTER", "escape": "KEY_ESC",
+           "del": "KEY_DELETE", "pgup": "KEY_PAGEUP", "pgdown": "KEY_PAGEDOWN", "printscreen": "KEY_SYSRQ",
+           "print": "KEY_SYSRQ", "prior": "KEY_PAGEUP", "next": "KEY_PAGEDOWN", "page_up": "KEY_PAGEUP",
+           "page_down": "KEY_PAGEDOWN"}
+
+
+def parse_combo(text):
+    """'ctrl+shift+z' -> [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_Z] codes; raises ValueError."""
+    out = []
+    for part in [p.strip().lower() for p in text.replace(" ", "").split("+") if p.strip()]:
+        name = MODS.get(part) or ALIASES.get(part) or ("KEY_" + part.upper())
+        if name not in CODES:
+            raise ValueError(f"unknown key: {part}")
+        out.append(CODES[name])
+    if not out:
+        raise ValueError("empty shortcut")
+    return out
+
+
+def pretty_combo(text):
+    nice = {"ctrl": "Ctrl", "shift": "Shift", "alt": "Alt", "super": "Super", "equal": "=", "minus": "−",
+            "pagedown": "Page Down", "pageup": "Page Up", "sysrq": "Print Screen"}
+    return " + ".join(nice.get(p.lower(), p.capitalize() if len(p) > 1 else p.upper())
+                      for p in text.split("+") if p)
+
+
+def pretty_signature(sig):
+    if not sig:
+        return "nothing"
+    if sig in SENDS:
+        return SENDS[sig]
+    parts = sig.split("+")
+    mods = {"CTRL": "Ctrl", "SHIFT": "Shift", "ALT": "Alt", "META": "Super"}
+    return " + ".join(mods.get(p, p.removeprefix("KEY_").capitalize()) for p in parts)
+
+
+# typing text: US layout
+SHIFTED = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
+           '_': 'minus', '+': 'equal', '{': 'leftbrace', '}': 'rightbrace', '|': 'backslash', ':': 'semicolon',
+           '"': 'apostrophe', '<': 'comma', '>': 'dot', '?': 'slash', '~': 'grave'}
+PLAIN = {' ': 'space', '-': 'minus', '=': 'equal', '[': 'leftbrace', ']': 'rightbrace', '\\': 'backslash',
+         ';': 'semicolon', "'": 'apostrophe', ',': 'comma', '.': 'dot', '/': 'slash', '`': 'grave',
+         '\n': 'enter', '\t': 'tab'}
+
+
+def char_keys(ch):
+    if ch.isalpha() and ch.isascii():
+        return ([CODES["KEY_LEFTSHIFT"]] if ch.isupper() else []) + [CODES["KEY_" + ch.upper()]]
+    if ch.isdigit():
+        return [CODES["KEY_" + ch]]
+    if ch in PLAIN:
+        return [CODES["KEY_" + PLAIN[ch].upper()]]
+    if ch in SHIFTED:
+        return [CODES["KEY_LEFTSHIFT"], CODES["KEY_" + SHIFTED[ch].upper()]]
+    return None
+
+
+# ------------------------------------------------------------------ config
+def load_conf(kind):
+    """One device's settings: {"enabled", "devices": {kind: {"map", "profiles"}}}."""
+    try:
+        with open(conf_path(kind)) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        c = {}
+    c.setdefault("enabled", True)
+    dc = c.setdefault("devices", {}).setdefault(kind, {})
+    dc.setdefault("map", dict(DEVICES[kind]["map"]))
+    dc.setdefault("profiles", {"default": {}})
+    dc["profiles"].setdefault("default", {})
+    return c
+
+
+def save_conf(kind, c):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    path = conf_path(kind)
+    with open(path + ".tmp", "w") as f:
+        json.dump(c, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def signature_control(conf, kind, sig):
+    return conf["devices"][kind]["map"].get(sig)
+
+
+def control_signature(conf, kind, control):
+    for k, v in conf["devices"][kind]["map"].items():
+        if v == control:
+            return k
+    return None
+
+
+def action_for(conf, kind, control, app_id):
+    profs = conf["devices"][kind]["profiles"]
+    if app_id:
+        prof = profs.get("app:" + app_id)
+        if prof and control in prof:
+            return prof[control]
+    return profs["default"].get(control, {"type": "default"})
+
+
+def describe(conf, kind, control, action):
+    t = action.get("type", "default")
+    if t == "default":
+        sig = control_signature(conf, kind, control)
+        return pretty_signature(sig) if sig else "nothing (sends no key)"
+    if t == "none":
+        return "Nothing"
+    if t == "keys":
+        return "Shortcut " + pretty_combo(action.get("keys", ""))
+    if t == "action":
+        return ACTIONS.get(action.get("id"), ("", "?"))[1]
+    if t == "app":
+        return "Open " + action.get("name", action.get("app", "app"))
+    if t == "command":
+        return "Run: " + action.get("command", "")
+    if t == "text":
+        return "Type: " + action.get("text", "")
+    return t
+
+
+def original_keys(sig):
+    """Key codes of a signature ("CTRL+KEY_C" -> [ctrl, c])."""
+    if not sig:
+        return []
+    out = []
+    for p in sig.split("+"):
+        name = MOD_KEY.get(p, p)
+        if name in CODES:
+            out.append(CODES[name])
+    return out
+
+
+# ------------------------------------------------------------------ devices
+def find_inputs():
+    """{kind: [/dev/input/eventN, ...]} for every device that is connected."""
+    try:
+        blocks = open("/proc/bus/input/devices").read().split("\n\n")
+    except OSError:
+        return {}
+    found = {}
+    for b in blocks:
+        m = re.search(r'N: Name="([^"]*)"', b)
+        h = re.search(r"H: Handlers=.*\b(event\d+)\b", b)
+        if not m or not h:
+            continue
+        for kind, d in DEVICES.items():
+            if m.group(1) in d["inputs"]:
+                found.setdefault(kind, []).append("/dev/input/" + h.group(1))
+    return found
+
+
+class VirtualKeyboard:
+    def __init__(self, pointer=False, name=b"Macro keys (remapped)"):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+        if pointer:   # trackballs: movement and scrolling pass through this device too
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+            for code in (0x00, 0x01, 0x06, 0x08, 0x0b, 0x0c):   # X, Y, HWHEEL, WHEEL, WHEEL_HI_RES, HWHEEL_HI_RES
+                fcntl.ioctl(self.fd, UI_SET_RELBIT, code)
+        for code in range(1, 0x2ff):
+            if code in NAMES or code < 0x100:
+                try:
+                    fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+                except OSError:
+                    pass
+        setup = struct.pack("HHHH80sI", 0x06, 0x1209, 0x0d1b, 1, name[:79], 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        time.sleep(0.2)   # let the compositor pick the new device up
+
+    def emit(self, typ, code, value):
+        os.write(self.fd, EVENT.pack(0, 0, typ, code, value))
+
+    def key(self, code, value):
+        self.emit(EV_KEY, code, value)
+        self.emit(EV_SYN, 0, 0)
+
+    def tap(self, codes):
+        for c in codes:
+            self.key(c, 1)
+        for c in reversed(codes):
+            self.key(c, 0)
+
+    def type_text(self, text):
+        for ch in text:
+            ks = char_keys(ch)
+            if ks:
+                self.tap(ks)
+                time.sleep(0.005)
+
+
+class Group:
+    """The input devices of one physical device, with its modifier state (chords such as Ctrl+C)."""
+    def __init__(self, kind):
+        self.kind = kind
+        self.fds = {}            # fd -> path
+        self.mods = {}           # modifier name -> code held
+        self.mods_used = False
+
+
+# ------------------------------------------------------------------ the service
+class Service:
+    def __init__(self, kind):
+        self.kind = kind
+        self.sock = sock_path(kind)
+        self.conf = load_conf(kind)
+        self.mtime = self.mtime_now()
+        d = DEVICES[kind]
+        self.pointer = bool(d.get("pointer"))
+        self.vk = VirtualKeyboard(self.pointer, (d["name"] + " (remapped)").encode())
+        self.groups = {kind: Group(kind)}
+        self.held = {}     # button code -> combo codes held down (a shortcut on a mouse button is held while the button is)
+        self.focus = (0, None)
+        self.clients = []
+        try:
+            os.unlink(self.sock)
+        except OSError:
+            pass
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.sock)
+        os.chmod(self.sock, 0o600)
+        self.srv.listen(4)
+        self.srv.setblocking(False)
+
+    def mtime_now(self):
+        try:
+            return os.stat(conf_path(self.kind)).st_mtime
+        except OSError:
+            return 0
+
+    def status(self):
+        return {"event": "status", "remapping": bool(self.conf.get("enabled", True)),
+                "connected": {k: bool(g.fds) for k, g in self.groups.items()}}
+
+    def publish(self, obj):
+        line = (json.dumps(obj) + "\n").encode()
+        for c in list(self.clients):
+            try:
+                c.send(line)
+            except OSError:
+                self.clients.remove(c)
+                c.close()
+
+    def scan(self):
+        changed = False
+        for kind, paths in find_inputs().items():
+            if kind != self.kind:
+                continue
+            g = self.groups[kind]
+            for p in paths:
+                if p in g.fds.values():
+                    continue
+                try:
+                    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    continue
+                g.fds[fd] = p
+                self.grab(fd, bool(self.conf.get("enabled", True)))
+                changed = True
+                print(f"{kind}: {p}", flush=True)
+        if changed:
+            self.publish(self.status())
+
+    def grab(self, fd, on):
+        try:
+            fcntl.ioctl(fd, EVIOCGRAB, 1 if on else 0)
+        except OSError as e:
+            print(f"grab failed: {e}", flush=True)
+
+    def apply_grab(self):
+        want = bool(self.conf.get("enabled", True))
+        for g in self.groups.values():
+            for fd in g.fds:
+                self.grab(fd, want)
+
+    def drop(self, g, fd):
+        print(f"{g.kind}: {g.fds.get(fd)} gone", flush=True)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        g.fds.pop(fd, None)
+        g.mods.clear()
+        self.publish(self.status())
+
+    def focused_app(self):
+        t, app = self.focus
+        if time.monotonic() - t < 0.4:
+            return app
+        app = None
+        try:
+            out = subprocess.run(["umbriel", "windows", "--json"], capture_output=True, text=True, timeout=1).stdout
+            for w in json.loads(out):
+                if w.get("focused"):
+                    app = w.get("app_id") or None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        self.focus = (time.monotonic(), app)
+        return app
+
+    def run_action(self, action, original):
+        t = action.get("type", "default")
+        if t == "default":
+            if original:
+                self.vk.tap(original)
+        elif t == "keys":
+            try:
+                self.vk.tap(parse_combo(action.get("keys", "")))
+            except ValueError as e:
+                print(e, flush=True)
+        elif t == "action" and action.get("id") in ACTIONS:
+            argv = ACTIONS[action["id"]][2]
+            if argv[0] == "sh":
+                argv = ["sh", "-c", os.path.expanduser(argv[2])]
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        elif t == "app" and action.get("app"):
+            subprocess.Popen(["gtk-launch", action["app"].removesuffix(".desktop")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        elif t == "command" and action.get("command"):
+            subprocess.Popen(["sh", "-c", action["command"]], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        elif t == "text":
+            self.vk.type_text(action.get("text", ""))
+
+    def pressed(self, kind, sig, original, remap=True):
+        control = signature_control(self.conf, kind, sig)
+        app = self.focused_app() if remap else None
+        self.publish({"event": "press", "device": kind, "signature": sig, "control": control, "app": app})
+        if not remap:
+            return
+        if control is None:
+            self.vk.tap(original)
+            return
+        self.run_action(action_for(self.conf, kind, control, app), original)
+
+    def test(self, kind, control):
+        sig = control_signature(self.conf, kind, control)
+        self.publish({"event": "press", "device": kind, "signature": sig, "control": control, "app": None,
+                      "test": True})
+        self.run_action(action_for(self.conf, kind, control, self.focused_app()), original_keys(sig))
+
+    def handle_pointer(self, g, typ, code, value, remap):
+        """Trackballs: movement and scrolling go straight through; buttons and wheel tilt run their action.
+        Returns True when the event was handled here."""
+        if typ == EV_SYN:
+            if remap:
+                self.vk.emit(EV_SYN, code, value)
+            return True
+        if typ == EV_REL:
+            if code in (REL_HWHEEL, REL_HWHEEL_HI_RES) and value:
+                sig = "REL_HWHEEL" + ("+" if value > 0 else "-")
+                control = signature_control(self.conf, g.kind, sig)
+                if code == REL_HWHEEL:
+                    self.publish({"event": "press", "device": g.kind, "signature": sig, "control": control, "app": None})
+                if remap and control:
+                    action = action_for(self.conf, g.kind, control, self.focused_app() if code == REL_HWHEEL else None)
+                    if action.get("type", "default") != "default":
+                        if code == REL_HWHEEL and action.get("type") != "none":
+                            self.run_action(action, [])
+                        return True          # tilt remapped: the scroll itself is dropped
+            if remap:
+                self.vk.emit(EV_REL, code, value)
+            return True
+        if typ != EV_KEY or code < 0x110 or code > 0x117:
+            return False                     # keys from the receiver's keyboard part: the normal path
+        sig = NAMES.get(code, str(code))
+        control = signature_control(self.conf, g.kind, sig)
+        if value == 1:
+            self.publish({"event": "press", "device": g.kind, "signature": sig, "control": control, "app": None})
+        if not remap:
+            return True
+        if value == 0 and code in self.held:  # a shortcut held with the button: let it go
+            for c in reversed(self.held.pop(code)):
+                self.vk.key(c, 0)
+            return True
+        action = action_for(self.conf, g.kind, control, self.focused_app() if value == 1 else None) \
+            if control and control not in DEVICES[g.kind].get("fixed", []) else {"type": "default"}
+        t = action.get("type", "default")
+        if t == "default":
+            self.vk.emit(EV_KEY, code, value)   # SYN follows from the device
+        elif t == "keys" and value == 1:
+            try:
+                combo = parse_combo(action.get("keys", ""))
+                for c in combo:
+                    self.vk.key(c, 1)
+                self.held[code] = combo
+            except ValueError as e:
+                print(e, flush=True)
+        elif value == 1 and t != "none":
+            self.run_action(action, [code])
+        return True
+
+    def handle(self, g, typ, code, value, remap):
+        """One key event. Modifiers held by the device form a chord with the next key (Ctrl+C, Super+L)."""
+        if self.pointer and self.handle_pointer(g, typ, code, value, remap):
+            return
+        if typ != EV_KEY:
+            return
+        mod = MOD_OF.get(code)
+        if mod:
+            if value == 1:
+                if not g.mods:
+                    g.mods_used = False
+                g.mods[mod] = code
+            elif value == 0:
+                g.mods.pop(mod, None)
+                if not g.mods_used and remap:
+                    self.vk.tap([code])      # a modifier pressed alone: pass it on
+            return
+        if value == 0:
+            return
+        prefix = "+".join(m for m, _ in MOD_ORDER if m in g.mods)
+        sig = (prefix + "+" if prefix else "") + NAMES.get(code, str(code))
+        if value == 2:   # auto-repeat of a held key: repeat only for knob turns
+            if (signature_control(self.conf, g.kind, sig) or "").startswith("knob_") and not prefix:
+                self.pressed(g.kind, sig, [code], remap)
+            return
+        g.mods_used = True
+        self.pressed(g.kind, sig, [g.mods[m] for m, _ in MOD_ORDER if m in g.mods] + [code], remap)
+
+    def loop(self):
+        last_scan = 0
+        while True:
+            if time.monotonic() - last_scan > 2:
+                last_scan = time.monotonic()
+                self.scan()
+            fd_group = {fd: g for g in self.groups.values() for fd in g.fds}
+            r, _, _ = select.select([self.srv] + self.clients + list(fd_group), [], [], 1.0)
+            m = self.mtime_now()
+            if m != self.mtime:
+                self.mtime = m
+                self.conf = load_conf(self.kind)
+                self.apply_grab()
+                self.publish({"event": "config"})
+            remap = bool(self.conf.get("enabled", True))
+            for fd in r:
+                if fd is self.srv:
+                    try:
+                        c, _ = self.srv.accept()
+                        c.setblocking(False)
+                        self.clients.append(c)
+                        c.send((json.dumps(self.status()) + "\n").encode())
+                    except OSError:
+                        pass
+                elif fd in fd_group:
+                    g = fd_group[fd]
+                    try:
+                        data = os.read(fd, EVENT.size * 64)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        self.drop(g, fd)
+                        continue
+                    for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                        _, _, typ, code, value = EVENT.unpack_from(data, i)
+                        self.handle(g, typ, code, value, remap)
+                else:   # a client (the app): {"cmd": "test", "device": kind, "control": id}
+                    try:
+                        data = fd.recv(4096)
+                        if not data:
+                            raise OSError
+                        for line in data.decode(errors="replace").splitlines():
+                            try:
+                                req = json.loads(line)
+                            except ValueError:
+                                continue
+                            kind = req.get("device")
+                            if req.get("cmd") == "test" and kind in DEVICES and \
+                                    req.get("control") in dict(DEVICES[kind]["controls"]):
+                                self.test(kind, req["control"])
+                    except OSError:
+                        self.clients.remove(fd)
+                        fd.close()
+
+
+def test_action(kind, control):
+    """Ask the running service to run this control's action (as a real press would)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path(kind))
+    s.send((json.dumps({"cmd": "test", "device": kind, "control": control}) + "\n").encode())
+    time.sleep(0.3)
+    s.close()
+
+
+def main():
+    if len(sys.argv) > 3 and sys.argv[1] == "--test":
+        test_action(sys.argv[2], sys.argv[3])
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "--device" and sys.argv[2] in DEVICES:
+        Service(sys.argv[2]).loop()
+        return
+    print(__doc__)
+    sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help") else 2)
+
+
+if __name__ == "__main__":
+    main()
